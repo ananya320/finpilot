@@ -3,7 +3,7 @@ from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Optional
 
-import fitz  # PyMuPDF
+import pymupdf as fitz   # PyMuPDF
 import pandas as pd
 from dateutil import parser as dateparser
 from pydantic import BaseModel
