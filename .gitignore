@@ -1,0 +1,7 @@
+.env
+.venv/
+__pycache__/
+finpilot.db
+chroma_data/
+node_modules/
+dist/
