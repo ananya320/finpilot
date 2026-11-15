@@ -11,6 +11,8 @@ from app.models import Transaction, Match
 from app.services.reconcile import run_reconciliation
 from app.services.extract import parse_amount
 
+BIZ = 1  # every test row belongs to business 1
+
 
 @pytest.fixture
 def db():
@@ -21,9 +23,9 @@ def db():
     session.close()
 
 
-def add(db, source, d, desc, amount, ref=None, party=None):
-    db.add(Transaction(source=source, txn_date=date.fromisoformat(d), description=desc,
-                       amount=Decimal(amount), reference=ref, counterparty=party))
+def add(db, source, d, desc, amount, ref=None, party=None, business_id=BIZ):
+    db.add(Transaction(business_id=business_id, source=source, txn_date=date.fromisoformat(d),
+                       description=desc, amount=Decimal(amount), reference=ref, counterparty=party))
 
 
 def seed(db):
@@ -37,19 +39,19 @@ def seed(db):
     db.commit()
 
 
-def statuses(db):
-    return sorted(m.status for m in db.query(Match).all())
+def statuses(db, business_id=BIZ):
+    return sorted(m.status for m in db.query(Match).filter(Match.business_id == business_id).all())
 
 
 def test_full_scenario(db):
     seed(db)
-    run_reconciliation(db)
+    run_reconciliation(db, BIZ)
     assert statuses(db) == ["amount_mismatch", "matched", "possible_duplicate", "unexplained", "unpaid"]
 
 
 def test_underpayment_difference(db):
     seed(db)
-    run_reconciliation(db)
+    run_reconciliation(db, BIZ)
     m = db.query(Match).filter_by(status="amount_mismatch").one()
     assert m.difference == Decimal("20.00")
     assert "underpaid by 20.00" in m.reason
@@ -57,9 +59,9 @@ def test_underpayment_difference(db):
 
 def test_rerun_is_idempotent(db):
     seed(db)
-    run_reconciliation(db)
+    run_reconciliation(db, BIZ)
     first = statuses(db)
-    run_reconciliation(db)
+    run_reconciliation(db, BIZ)
     assert statuses(db) == first
 
 
@@ -68,8 +70,18 @@ def test_one_payment_never_matches_two_invoices(db):
     add(db, "invoice", "2026-09-28", "", "100.00", "A-1", "X")
     add(db, "invoice", "2026-09-29", "", "100.00", "A-2", "X")
     db.commit()
-    run_reconciliation(db)
+    run_reconciliation(db, BIZ)
     assert statuses(db).count("unpaid") == 1
+
+
+def test_businesses_are_isolated(db):
+    seed(db)  # business 1 has the full scenario
+    add(db, "invoice", "2026-09-28", "", "75.00", "B-1", "Other Co", business_id=2)
+    db.commit()
+    run_reconciliation(db, 1)
+    run_reconciliation(db, 2)
+    assert statuses(db, 2) == ["unpaid"]   # business 2 never sees business 1's payments
+    assert len(statuses(db, 1)) == 5       # and business 1's results are unchanged
 
 
 @pytest.mark.parametrize("raw,expected", [

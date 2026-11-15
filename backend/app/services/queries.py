@@ -12,22 +12,23 @@ def _j(obj):
     return json.dumps(obj, default=str)
 
 
-def recon_summary() -> str:
+def recon_summary(business_id: int) -> str:
     with SessionLocal() as db:
-        return _j(summary(db))
+        return _j(summary(db, business_id))
 
 
-def list_discrepancies(status: str = "") -> str:
+def list_discrepancies(business_id: int, status: str = "") -> str:
     with SessionLocal() as db:
-        q = db.query(Match)
+        q = db.query(Match).filter(Match.business_id == business_id)
         q = q.filter(Match.status == status) if status else q.filter(Match.status != "matched")
         return _j([dict(status=m.status, difference=m.difference, reason=m.reason) for m in q.limit(50)])
 
 
-def search_transactions(text: str = "", source: str = "", min_amount: Optional[float] = None,
-                        max_amount: Optional[float] = None, start_date: str = "", end_date: str = "") -> str:
+def search_transactions(business_id: int, text: str = "", source: str = "",
+                        min_amount: Optional[float] = None, max_amount: Optional[float] = None,
+                        start_date: str = "", end_date: str = "") -> str:
     with SessionLocal() as db:
-        q = db.query(Transaction)
+        q = db.query(Transaction).filter(Transaction.business_id == business_id)
         if text:
             like = f"%{text}%"
             q = q.filter(Transaction.description.ilike(like) | Transaction.reference.ilike(like)
@@ -48,21 +49,23 @@ def search_transactions(text: str = "", source: str = "", min_amount: Optional[f
                             for t in rows[:30]]})
 
 
-def explain_invoice(invoice_ref: str) -> str:
+def explain_invoice(business_id: int, invoice_ref: str) -> str:
     with SessionLocal() as db:
-        inv = db.query(Transaction).filter(Transaction.source == "invoice",
-                                           Transaction.reference.ilike(invoice_ref)).first()
+        inv = (db.query(Transaction)
+                 .filter(Transaction.business_id == business_id, Transaction.source == "invoice",
+                         Transaction.reference.ilike(invoice_ref)).first())
         if not inv:
             return _j({"error": f"No invoice {invoice_ref} found."})
-        m = db.query(Match).filter(Match.invoice_id == inv.id).first()
+        m = (db.query(Match)
+               .filter(Match.business_id == business_id, Match.invoice_id == inv.id).first())
         return _j({"invoice": dict(ref=inv.reference, amount=inv.amount, date=inv.txn_date,
                                    vendor=inv.counterparty),
                    "result": dict(status=m.status, difference=m.difference, reason=m.reason) if m
                              else "Reconciliation has not been run yet."})
 
 
-def search_documents(query: str) -> str:
+def search_documents(business_id: int, query: str) -> str:
     try:
-        return _j(vectorstore.search(query))
+        return _j(vectorstore.search(query, business_id))
     except Exception as e:
         return _j({"error": str(e)})

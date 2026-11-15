@@ -2,6 +2,7 @@ import re
 from typing import Literal, Optional
 
 from langchain_core.messages import SystemMessage, AIMessage, ToolMessage
+from langchain_core.runnables import RunnableConfig
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.checkpoint.memory import MemorySaver
@@ -25,38 +26,50 @@ def _text(content) -> str:
 
 
 # ---------- tools ----------
-@tool
-def recon_summary() -> str:
-    """Counts and total differences of reconciliation results grouped by status."""
-    return queries.recon_summary()
+def _bid(config: RunnableConfig) -> int:
+    """The business id is set by the server for the logged-in user, never by the model."""
+    return int(config["configurable"]["business_id"])
+
 
 @tool
-def list_discrepancies(status: str = "") -> str:
+def recon_summary(config: RunnableConfig) -> str:
+    """Counts and total differences of reconciliation results grouped by status."""
+    return queries.recon_summary(_bid(config))
+
+
+@tool
+def list_discrepancies(config: RunnableConfig, status: str = "") -> str:
     """List reconciliation items that are not fully matched. Optional status filter:
     probable, amount_mismatch, unpaid, unexplained, possible_duplicate, matched."""
-    return queries.list_discrepancies(status)
+    return queries.list_discrepancies(_bid(config), status)
+
 
 @tool
-def explain_invoice(invoice_ref: str) -> str:
+def explain_invoice(invoice_ref: str, config: RunnableConfig) -> str:
     """Get the reconciliation result and explanation for a specific invoice number."""
-    return queries.explain_invoice(invoice_ref)
+    return queries.explain_invoice(_bid(config), invoice_ref)
+
 
 @tool
-def search_transactions(text: str = "", source: str = "", min_amount: Optional[float] = None,
-                        max_amount: Optional[float] = None, start_date: str = "", end_date: str = "") -> str:
+def search_transactions(config: RunnableConfig, text: str = "", source: str = "",
+                        min_amount: Optional[float] = None, max_amount: Optional[float] = None,
+                        start_date: str = "", end_date: str = "") -> str:
     """Search transactions. text matches description/reference/counterparty. source: bank|invoice|payment.
     Amounts compare on absolute value. Dates are YYYY-MM-DD. Returns rows plus their exact total."""
-    return queries.search_transactions(text, source, min_amount, max_amount, start_date, end_date)
+    return queries.search_transactions(_bid(config), text, source, min_amount, max_amount,
+                                       start_date, end_date)
+
 
 @tool
-def search_documents(query: str) -> str:
+def search_documents(query: str, config: RunnableConfig) -> str:
     """Semantic search over the raw text of uploaded documents (terms, notes, free text)."""
-    return queries.search_documents(query)
+    return queries.search_documents(_bid(config), query)
 
 
 # ---------- specialist agents ----------
 COMMON = ("Never calculate, estimate or recall numbers yourself. Always call a tool and quote its results "
           "exactly. If a tool returns nothing, say there is no matching data. Be concise.")
+
 
 def make_agent(tools, system: str):
     llm = _llm().bind_tools(tools)
@@ -88,6 +101,7 @@ ROUTER_PROMPT = ("Classify the user's latest question.\n"
                  "documents = questions about text inside uploaded files (terms, notes).\n"
                  "other = anything unrelated to the user's financial data.")
 
+
 def router(state: State):
     r = _llm().with_structured_output(Route).invoke(
         [SystemMessage(content=ROUTER_PROMPT)] + state["messages"][-4:])
@@ -100,6 +114,7 @@ def out_of_scope(state: State):
 
 
 NUM = re.compile(r"\d[\d,]*\.?\d*")
+
 
 def verifier(state: State):
     """Plain Python check: every number in the answer must appear in a tool result."""
@@ -147,7 +162,8 @@ def build_graph():
 graph = build_graph()
 
 
-def ask(message: str, session_id: str) -> str:
+def ask(message: str, thread_id: str, business_id: int) -> str:
     out = graph.invoke({"messages": [("user", message)]},
-                       config={"configurable": {"thread_id": session_id}, "recursion_limit": 25})
+                       config={"configurable": {"thread_id": thread_id, "business_id": business_id},
+                               "recursion_limit": 25})
     return _text(out["messages"][-1].content)
