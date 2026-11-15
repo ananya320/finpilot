@@ -15,8 +15,9 @@ from . import queries
 
 
 def _llm():
+    # max_retries lets short Google overloads (503) pass without breaking the chat
     return ChatGoogleGenerativeAI(model=settings.gemini_model, google_api_key=settings.google_api_key,
-                                  temperature=0)
+                                  temperature=0, max_retries=5, timeout=60)
 
 
 def _text(content) -> str:

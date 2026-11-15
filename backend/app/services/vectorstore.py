@@ -1,17 +1,22 @@
-import chromadb
+from ..config import settings
 
 _col = None
 
 
 def collection():
     global _col
+    if not settings.enable_vector_search:
+        raise RuntimeError("Document search is turned off on this server.")
     if _col is None:
+        import chromadb   # imported here so a disabled server never loads it
         client = chromadb.PersistentClient(path="./chroma_data")
         _col = client.get_or_create_collection("documents")
     return _col
 
 
 def index_text(doc_id: int, business_id: int, filename: str, text: str, size: int = 1000):
+    if not settings.enable_vector_search:
+        return
     chunks = [text[i:i + size] for i in range(0, len(text), size) if text[i:i + size].strip()]
     if not chunks:
         return
@@ -29,8 +34,10 @@ def search(query: str, business_id: int, k: int = 4):
 
 
 def delete_document(doc_id: int):
-    collection().delete(where={"doc_id": doc_id})
+    if settings.enable_vector_search:
+        collection().delete(where={"doc_id": doc_id})
 
 
 def delete_business(business_id: int):
-    collection().delete(where={"business_id": business_id})
+    if settings.enable_vector_search:
+        collection().delete(where={"business_id": business_id})

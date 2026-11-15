@@ -1,0 +1,5 @@
+invoice_number,vendor,date,amount
+INV-1001,Acme Supplies,2026-09-28,500.00
+INV-1002,Globex Ltd,2026-09-30,1200.00
+INV-1003,Initech,2026-10-01,300.00
+INV-1005,CloudHost,2026-10-01,89.99

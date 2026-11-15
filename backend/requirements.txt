@@ -13,3 +13,4 @@ langchain-core
 langchain-google-genai
 mcp
 langchain-mcp-adapters
+psycopg2-binary

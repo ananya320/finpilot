@@ -21,8 +21,8 @@ export default function Chat() {
     try {
       const r = await sendChat(q, session.current);
       setMsgs((m) => [...m, { role: "bot", text: r.answer || "No answer returned." }]);
-    } catch {
-      setMsgs((m) => [...m, { role: "bot", text: "Something went wrong. Is the backend running?" }]);
+    } catch (e) {
+      setMsgs((m) => [...m, { role: "bot", text: e.message }]);
     }
     setBusy(false);
   }
