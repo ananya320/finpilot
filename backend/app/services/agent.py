@@ -1,119 +1,153 @@
-import json
-from typing import Annotated, TypedDict, Optional
-from datetime import date
+import re
+from typing import Literal, Optional
 
-from langchain_core.messages import SystemMessage
+from langchain_core.messages import SystemMessage, AIMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langgraph.checkpoint.memory import MemorySaver
-from langgraph.graph import StateGraph, START
-from langgraph.graph.message import add_messages
+from langgraph.graph import StateGraph, MessagesState, START, END
 from langgraph.prebuilt import ToolNode, tools_condition
+from pydantic import BaseModel
 
 from ..config import settings
-from ..db import SessionLocal
-from ..models import Transaction, Match
-from . import vectorstore
-from .reconcile import summary
+from . import queries
 
-SYSTEM = """You are FinPilot, a financial operations assistant.
-RULES:
-- Never calculate, estimate or recall numbers yourself. Always call a tool and quote its results exactly.
-- If a tool returns nothing, say there is no matching data. Never guess or fill gaps.
-- Explain reconciliation mismatches using the 'reason' field from the tools, then suggest a next step
-  (e.g. contact vendor, check for a credit note, confirm a duplicate).
-- Rows with needs_review=true were not verified against the source; mention that when relevant.
-- Be concise. State amounts with their dates and references."""
 
-def _j(obj):
-    return json.dumps(obj, default=str)
+def _llm():
+    return ChatGoogleGenerativeAI(model=settings.gemini_model, google_api_key=settings.google_api_key,
+                                  temperature=0)
 
+
+def _text(content) -> str:
+    if isinstance(content, list):
+        return "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
+    return content
+
+
+# ---------- tools ----------
 @tool
 def recon_summary() -> str:
     """Counts and total differences of reconciliation results grouped by status."""
-    with SessionLocal() as db:
-        return _j(summary(db))
+    return queries.recon_summary()
 
 @tool
 def list_discrepancies(status: str = "") -> str:
     """List reconciliation items that are not fully matched. Optional status filter:
     probable, amount_mismatch, unpaid, unexplained, possible_duplicate, matched."""
-    with SessionLocal() as db:
-        q = db.query(Match)
-        q = q.filter(Match.status == status) if status else q.filter(Match.status != "matched")
-        return _j([dict(status=m.status, difference=m.difference, reason=m.reason) for m in q.limit(50)])
+    return queries.list_discrepancies(status)
+
+@tool
+def explain_invoice(invoice_ref: str) -> str:
+    """Get the reconciliation result and explanation for a specific invoice number."""
+    return queries.explain_invoice(invoice_ref)
 
 @tool
 def search_transactions(text: str = "", source: str = "", min_amount: Optional[float] = None,
                         max_amount: Optional[float] = None, start_date: str = "", end_date: str = "") -> str:
     """Search transactions. text matches description/reference/counterparty. source: bank|invoice|payment.
     Amounts compare on absolute value. Dates are YYYY-MM-DD. Returns rows plus their exact total."""
-    with SessionLocal() as db:
-        q = db.query(Transaction)
-        if text:
-            like = f"%{text}%"
-            q = q.filter(Transaction.description.ilike(like) | Transaction.reference.ilike(like)
-                         | Transaction.counterparty.ilike(like))
-        if source: q = q.filter(Transaction.source == source)
-        if start_date: q = q.filter(Transaction.txn_date >= date.fromisoformat(start_date))
-        if end_date: q = q.filter(Transaction.txn_date <= date.fromisoformat(end_date))
-        rows = [t for t in q.order_by(Transaction.txn_date).limit(200)
-                if (min_amount is None or abs(t.amount) >= min_amount)
-                and (max_amount is None or abs(t.amount) <= max_amount)]
-        total = sum(t.amount for t in rows)
-        return _j({"count": len(rows), "total": total,
-                   "rows": [dict(date=t.txn_date, source=t.source, description=t.description,
-                                 reference=t.reference, amount=t.amount, needs_review=t.needs_review)
-                            for t in rows[:30]]})
-
-@tool
-def explain_invoice(invoice_ref: str) -> str:
-    """Get the reconciliation result and explanation for a specific invoice number."""
-    with SessionLocal() as db:
-        inv = db.query(Transaction).filter(Transaction.source == "invoice",
-                                           Transaction.reference.ilike(invoice_ref)).first()
-        if not inv:
-            return _j({"error": f"No invoice {invoice_ref} found."})
-        m = db.query(Match).filter(Match.invoice_id == inv.id).first()
-        return _j({"invoice": dict(ref=inv.reference, amount=inv.amount, date=inv.txn_date,
-                                   vendor=inv.counterparty),
-                   "result": dict(status=m.status, difference=m.difference, reason=m.reason) if m
-                             else "Reconciliation has not been run yet."})
+    return queries.search_transactions(text, source, min_amount, max_amount, start_date, end_date)
 
 @tool
 def search_documents(query: str) -> str:
     """Semantic search over the raw text of uploaded documents (terms, notes, free text)."""
-    try:
-        return _j(vectorstore.search(query))
-    except Exception as e:
-        return _j({"error": str(e)})
+    return queries.search_documents(query)
 
-TOOLS = [recon_summary, list_discrepancies, search_transactions, explain_invoice, search_documents]
 
-class State(TypedDict):
-    messages: Annotated[list, add_messages]
+# ---------- specialist agents ----------
+COMMON = ("Never calculate, estimate or recall numbers yourself. Always call a tool and quote its results "
+          "exactly. If a tool returns nothing, say there is no matching data. Be concise.")
+
+def make_agent(tools, system: str):
+    llm = _llm().bind_tools(tools)
+
+    def call(state: MessagesState):
+        return {"messages": [llm.invoke([SystemMessage(content=system)] + state["messages"])]}
+
+    g = StateGraph(MessagesState)
+    g.add_node("agent", call)
+    g.add_node("tools", ToolNode(tools))
+    g.add_edge(START, "agent")
+    g.add_conditional_edges("agent", tools_condition)
+    g.add_edge("tools", "agent")
+    return g.compile()
+
+
+# ---------- supervisor ----------
+class State(MessagesState):
+    route: str
+
+
+class Route(BaseModel):
+    route: Literal["reconciliation", "transactions", "documents", "other"]
+
+
+ROUTER_PROMPT = ("Classify the user's latest question.\n"
+                 "reconciliation = invoice status, mismatches, unpaid, duplicates, explanations.\n"
+                 "transactions = searching or totalling transactions by date, amount, vendor.\n"
+                 "documents = questions about text inside uploaded files (terms, notes).\n"
+                 "other = anything unrelated to the user's financial data.")
+
+def router(state: State):
+    r = _llm().with_structured_output(Route).invoke(
+        [SystemMessage(content=ROUTER_PROMPT)] + state["messages"][-4:])
+    return {"route": r.route}
+
+
+def out_of_scope(state: State):
+    return {"messages": [AIMessage(content="I can only help with your uploaded transactions, "
+                                           "invoices and reconciliation results.")]}
+
+
+NUM = re.compile(r"\d[\d,]*\.?\d*")
+
+def verifier(state: State):
+    """Plain Python check: every number in the answer must appear in a tool result."""
+    answer = _text(state["messages"][-1].content)
+    tool_text = " ".join(str(m.content) for m in state["messages"] if isinstance(m, ToolMessage))
+    tool_text = tool_text.replace(",", "")
+    bad = []
+    for n in NUM.findall(answer.replace(",", "")):
+        n = n.rstrip(".")
+        if len(n) >= 3 and n not in tool_text:
+            bad.append(n)
+    if bad:
+        warn = f"\n\n⚠ Could not verify these figures against the database: {', '.join(sorted(set(bad)))}"
+        return {"messages": [AIMessage(content=answer + warn)]}
+    return {}
+
 
 def build_graph():
-    llm = ChatGoogleGenerativeAI(model=settings.gemini_model, google_api_key=settings.google_api_key,
-                                 temperature=0).bind_tools(TOOLS)
-
-    def agent(state: State):
-        return {"messages": [llm.invoke([SystemMessage(content=SYSTEM)] + state["messages"])]}
-
     g = StateGraph(State)
-    g.add_node("agent", agent)
-    g.add_node("tools", ToolNode(TOOLS))
-    g.add_edge(START, "agent")
-    g.add_conditional_edges("agent", tools_condition)   # tool call -> "tools", otherwise END
-    g.add_edge("tools", "agent")
-    return g.compile(checkpointer=MemorySaver())        # memory per session_id
+    g.add_node("router", router)
+    g.add_node("recon_agent", make_agent(
+        [recon_summary, list_discrepancies, explain_invoice],
+        "You are the reconciliation specialist. Explain mismatches using the 'reason' field from tools, "
+        "then suggest a next step (contact vendor, check for a credit note, confirm a duplicate). " + COMMON))
+    g.add_node("txn_agent", make_agent(
+        [search_transactions],
+        "You are the transaction search specialist. Rows with needs_review=true were not verified "
+        "against the source; mention that when relevant. " + COMMON))
+    g.add_node("docs_agent", make_agent(
+        [search_documents],
+        "You answer questions from uploaded document text. Cite the filename. " + COMMON))
+    g.add_node("out_of_scope", out_of_scope)
+    g.add_node("verifier", verifier)
+
+    g.add_edge(START, "router")
+    g.add_conditional_edges("router", lambda s: s["route"], {
+        "reconciliation": "recon_agent", "transactions": "txn_agent",
+        "documents": "docs_agent", "other": "out_of_scope"})
+    for n in ["recon_agent", "txn_agent", "docs_agent", "out_of_scope"]:
+        g.add_edge(n, "verifier")
+    g.add_edge("verifier", END)
+    return g.compile(checkpointer=MemorySaver())
+
 
 graph = build_graph()
 
+
 def ask(message: str, session_id: str) -> str:
     out = graph.invoke({"messages": [("user", message)]},
-                       config={"configurable": {"thread_id": session_id}, "recursion_limit": 12})
-    content = out["messages"][-1].content
-    if isinstance(content, list):   # Gemini sometimes returns content parts
-        content = "".join(p.get("text", "") if isinstance(p, dict) else str(p) for p in content)
-    return content
+                       config={"configurable": {"thread_id": session_id}, "recursion_limit": 25})
+    return _text(out["messages"][-1].content)
